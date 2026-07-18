@@ -256,32 +256,26 @@ def default_forecast_date() -> str:
     return default_rdn_import_date()
 
 
-def delivery_dates_d1_d2(*, as_of: datetime | None = None) -> tuple[str, str]:
-    """Daty dostawy D+1 i D+2 względem as_of (domyślnie teraz, lokalnie)."""
+def delivery_date_d1(*, as_of: datetime | None = None) -> str:
+    """Data dostawy D+1 względem as_of (domyślnie teraz, lokalnie)."""
     base = as_of or datetime.now()
-    d1 = (base + timedelta(days=1)).strftime("%Y-%m-%d")
-    d2 = (base + timedelta(days=2)).strftime("%Y-%m-%d")
-    return d1, d2
+    return (base + timedelta(days=1)).strftime("%Y-%m-%d")
 
 
-def fetch_forecasts_d1_d2(*, as_of: datetime | None = None) -> dict[str, Any]:
+def fetch_forecast_d1(*, as_of: datetime | None = None) -> dict[str, Any]:
     """
-    Pobiera prognozy modelu pradcast.pl dla D+1 i D+2.
+    Pobiera prognozę modelu pradcast.pl dla D+1.
 
     Zwraca:
       {
         "as_of": "...",
-        "horizons": {
-          "D+1": { date, source, currency, unit, prices[24] },
-          "D+2": { ... }
-        }
+        "horizon": "D+1",
+        "forecast": { date, source, currency, unit, prices[24] }
       }
     """
-    d1, d2 = delivery_dates_d1_d2(as_of=as_of)
+    d1 = delivery_date_d1(as_of=as_of)
     return {
         "as_of": (as_of or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
-        "horizons": {
-            "D+1": fetch_forecast_for_date(d1),
-            "D+2": fetch_forecast_for_date(d2),
-        },
+        "horizon": "D+1",
+        "forecast": fetch_forecast_for_date(d1),
     }
