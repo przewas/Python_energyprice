@@ -341,32 +341,43 @@ def forecast_pv():
         return jsonify({"error": str(e)}), 500
 
 
-from tge_get_from_db import get_tge_prices_data
+from tge_get_from_db import get_tge_prices_data, get_tge_prices_rolling
 
 
 @app.route("/api/tge")
 def get_tge_prices():
+    """
+    Domyślnie: rolling 36h godzinowych cen z t_rdn + is_forecast/zrodlo.
+
+    Query:
+      hours=36          — długość horyzontu (1..72), domyślnie 36
+      mode=day&date=... — stary tryb: jedna doba (wszystkie sloty 15-min)
+    """
     try:
-        raw_date = request.args.get("date")
+        mode = (request.args.get("mode") or "rolling").strip().lower()
 
-        date = None
+        if mode in ("day", "doba", "legacy"):
+            raw_date = request.args.get("date")
+            date = None
+            if raw_date:
+                m = re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw_date)
+                if m:
+                    try:
+                        dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                        date = dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+            if not date:
+                date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            return jsonify(get_tge_prices_data(date))
 
-        if raw_date:
-            m = re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw_date)
-            if m:
-                try:
-                    dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                    date = dt.strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+        hours_raw = request.args.get("hours", "36")
+        try:
+            hours = int(hours_raw)
+        except (TypeError, ValueError):
+            hours = 36
 
-        if not date:
-            date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-            print("⚠️ API /tge: brak lub błędna data – używam jutra")
-
-        result = get_tge_prices_data(date)
-
-        return jsonify(result)
+        return jsonify(get_tge_prices_rolling(horizon_hours=hours))
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -24,16 +24,15 @@ Dla BESS: po publikacji Fixingu sloty mają ceny potwierdzone; wcześniej w tych
 ## 2. Źródła danych (pipeline)
 
 ```
-pradcast.pl (prognoza D+1)
-        │
-        ▼
-   t_rdn  �adcast.pl (prognoza D+1)
-        │
-        ▼
-   t_rdn  ◄──── mail FIXING (Gmail) / tge.html  (ceny realne)
-        │
-        ▼
-   GET /api/tge   →  klient / agent BESS
+pradcast.pl (prognoza D+1) ──► t_rdn (is_forecast=1)
+                                      ▲
+mail FIXING / tge.html (realne) ──────┘  (is_forecast=0, nadpisuje prognozę)
+                                      │
+                                      ▼
+                               GET /api/tge
+                                      │
+                                      ▼
+                               agent / harmonogram BESS
 ```
 
 ### 2.1. Prognoza (pradcast.pl)
@@ -56,31 +55,52 @@ pradcast.pl (prognoza D+1)
 
 ## 3. API cen — `GET /api/tge`
 
-### Request
+### Request (domyślny — rolling 36h)
 ```
-GET /api/tge?date=YYYY-MM-DD
+GET /api/tge
+GET /api/tge?hours=36
 ```
 
 | Parametr | Wymagany | Opis |
 |----------|----------|------|
-| `date` | nie | Data doby dostawy `YYYY-MM-DD`. Brak/błąd → **jutro** (D+1). |
+| `hours` | nie | Liczba godzin horyzontu (1..72). Domyślnie **36**. |
+| `mode=day&date=YYYY-MM-DD` | nie | Stary tryb: jedna doba, wszystkie sloty 15-min. |
 
 Źródło odpowiedzi: wyłącznie tabela **`t_rdn`** (nie wywołuje pradcast na żywo).
+Start horyzontu: **bieżąca godzina** w `Europe/Warsaw` (zaokrąglenie w dół do pełnej godziny).
+Rozdzielczość: **1 godzina** (slot `:00` z bazy; baza trzyma też kwadranse).
 
-### Response (aktualny kształt)
+### Response (rolling 36)
 ```json
 {
-  "ceny_dla_dnia": "2026-07-19",
+  "horizon_hours": 36,
+  "timezone": "Europe/Warsaw",
+  "start": "2026-07-18 15:00:00",
+  "end": "2026-07-20 03:00:00",
+  "count": 36,
+  "available": 34,
+  "real_count": 10,
+  "forecast_count": 24,
   "godziny": [
     {
-      "godzina": "00:00",
-      "fixing1": { "cena": "576,46", "vol": "1234" },
-      "fixing2": { "cena": "0,00", "vol": "0" }
+      "doba": "2026-07-18",
+      "czas": "15:00:00",
+      "czas_ceny": "2026-07-18 15:00:00",
+      "godzina": "15:00",
+      "fixing1": { "cena": "420,00", "vol": "100" },
+      "fixing2": { "cena": "0,00", "vol": "0" },
+      "is_forecast": false,
+      "zrodlo": "realna"
     },
     {
-      "godzina": "00:15",
-      "fixing1": { "cena": "576,46", "vol": "1234" },
-      "fixing2": { "cena": "0,00", "vol": "0" }
+      "doba": "2026-07-19",
+      "czas": "10:00:00",
+      "czas_ceny": "2026-07-19 10:00:00",
+      "godzina": "10:00",
+      "fixing1": { "cena": "80,56", "vol": "0" },
+      "fixing2": { "cena": "0,00", "vol": "0" },
+      "is_forecast": true,
+      "zrodlo": "prognoza"
     }
   ]
 }
@@ -90,32 +110,30 @@ GET /api/tge?date=YYYY-MM-DD
 
 | Pole | Znaczenie |
 |------|-----------|
-| `ceny_dla_dnia` | Doba dostawy (data) |
-| `godziny[].godzina` | Początek slotu `HH:MM` (zwykle co 15 min) |
-| `godziny[].fixing1.cena` | **Cena do użycia w harmonogramie** — Fixing I, string z przecinkiem, **PLN/MWh** |
-| `godziny[].fixing1.vol` | Wolumen Fixing I (może być `"None"` / `"0"` przy prognozie) |
-| `godziny[].fixing2.*` | Fixing II — zwykle mniej istotny dla BESS; przy prognozie często 0 |
-
-**Uwaga:** API **nie zwraca dziś** pola `is_forecast`. Agent nie rozróżni w JSON prognozy od Fixingu — w bazie flaga jest, w odpowiedzi `/api/tge` jeszcze nie. Dla slotów przyszłych przed Fixingiem zakładaj, że to prognoza lub mieszanka; po Fixingu — cena realna.
+| `godziny` | Zawsze **36** elementów (lub `hours`) — po jednej cenie na godzinę |
+| `godziny[].czas_ceny` | Data+czas slotu (PL) |
+| `godziny[].fixing1.cena` | **Cena do harmonogramu** — PLN/MWh, string z przecinkiem; `null` jeśli brak w DB |
+| `godziny[].is_forecast` | `false` = cena realna (FIXING), `true` = prognoza, `null` = brak danych |
+| `godziny[].zrodlo` | `"realna"` \| `"prognoza"` \| `"brak"` — wygodna etykieta dla agenta |
 
 ### Konwersja ceny do float (Python)
 ```python
-price_pln_mwh = float(item["fixing1"]["cena"].replace(",", "."))
-# opcjonalnie do PLN/kWh:
-price_pln_kwh = price_pln_mwh / 1000.0
+raw = item["fixing1"]["cena"]
+if raw is None:
+    price_pln_mwh = None
+else:
+    price_pln_mwh = float(raw.replace(",", "."))
+    price_pln_kwh = price_pln_mwh / 1000.0
 ```
 
-### Agregacja do 24h (jeśli optymalizator chce godziny, nie kwadranse)
-Dla każdej godziny `H` weź cenę ze slotu `H:00` (lub średnią z `H:00..H:45` — przy prognozie wszystkie 4 są równe; przy Fixingu 15-min mogą się różnić).
-
+### Wektor pod optymalizator (pierwsze 24h z rolling 36)
 ```python
-# przykład: mapa godzina -> cena Fixing1
-hourly = {}
-for row in data["godziny"]:
-    hh, mm = row["godzina"].split(":")
-    if mm == "00":
-        hourly[int(hh)] = float(row["fixing1"]["cena"].replace(",", "."))
-# hourly[0]..hourly[23] w PLN/MWh
+market_price_kwh = []
+for row in data["godziny"][:24]:
+    raw = row["fixing1"]["cena"]
+    if raw is None:
+        raise ValueError(f"Brak ceny dla {row['czas_ceny']}")
+    market_price_kwh.append(float(raw.replace(",", ".")) / 1000.0)
 ```
 
 ---
@@ -172,48 +190,45 @@ Horyzont wewnętrzny: **dokładnie 24 sloty** (godziny 0..23).
 
 ## 6. Jak agent BESS powinien używać cen (rekomendacja)
 
-1. Wywołaj `GET /api/tge?date=<doba_dostawy>` (zwykle jutro).
-2. Weź **`fixing1.cena`** jako cenę rynkową RDN (PLN/MWh).
-3. Zbuduj wektor 24h (z kwadransów) w skali zgodnej z optymalizatorem.
-4. Do `POST /api/optimize` przekaż `market_price` + progn. PV + load + parametry baterii.
-5. Interpretuj `schedule`: ładuj przy niskiej cenie / nadmiarze PV, rozładowuj przy wysokiej cenie / deficycie.
-
-**Ograniczenia dzisiejszego API cen:**
-- zwraca **jedną dobę**, nie rolling 36h,
-- nie oznacza w JSON, czy slot to prognoza czy Fixing,
-- rozdzielczość w odpowiedzi to zwykle **15 min** (do 96 punktów na dobę).
-
-**Kierunek docelowy (w toku):** to samo `/api/tge` ma zwracać **rolling 36 godzin** z `t_rdn` (mieszanka realnych cen + prognoz w jednej tablicy). Do czasu wdrożenia agent bierze jedną dobę D+1 (lub wskazaną `date`).
+1. Wywołaj `GET /api/tge` (rolling **36** godzin od teraz).
+2. Dla każdego slotu weź **`fixing1.cena`** (PLN/MWh) oraz **`is_forecast` / `zrodlo`**.
+3. Do `POST /api/optimize` (24h) użyj pierwszych 24 slotów; reszta 12h = kontekst / plan dalszy.
+4. Slotów z `zrodlo="brak"` nie używaj w optymalizacji bez fallbacku.
+5. `zrodlo="prognoza"` — cena niepewna; `zrodlo="realna"` — Fixing, wyższy priorytet pewności.
 
 ---
 
 ## 7. Przykład wywołania
 
 ```bash
-# ceny na jutro (domyślnie też jutro bez parametru)
-curl -s "https://<host>/api/tge?date=2026-07-19"
+curl -s "https://<host>/api/tge"
+curl -s "https://<host>/api/tge?hours=36"
 ```
 
 ```python
 import requests
 
-r = requests.get("https://<host>/api/tge", params={"date": "2026-07-19"}, timeout=30)
+r = requests.get("https://<host>/api/tge", timeout=30)
 data = r.json()
-prices_mwh = [
-    float(x["fixing1"]["cena"].replace(",", "."))
-    for x in data["godziny"]
-    if x["godzina"].endswith(":00")
-]  # 24 wartości PLN/MWh
-market_price_kwh = [p / 1000.0 for p in prices_mwh]
+assert data["count"] == 36
+
+for row in data["godziny"]:
+    print(row["czas_ceny"], row["fixing1"]["cena"], row["zrodlo"], row["is_forecast"])
+
+market_price_kwh = [
+    float(x["fixing1"]["cena"].replace(",", ".")) / 1000.0
+    for x in data["godziny"][:24]
+    if x["fixing1"]["cena"] is not None
+]
 ```
 
 ---
 
 ## 8. Szybka ściąga dla agenta
 
-- **Cena sterująca BESS:** `fixing1.cena` z `/api/tge`.
-- **Jednostka w API:** PLN/MWh (przecinek dziesiętny).
-- **Skąd:** DB `t_rdn` = Fixing (mail/HTML) po publikacji, wcześniej prognoza pradcast D+1.
-- **Nie wołaj pradcast bezpośrednio** z agenta BESS — korzystaj z `/api/tge`.
-- **Optymalizacja:** `/api/optimize` wymaga 24-elementowego `market_price` + PV + load + parametry BESS.
-- **Timezone:** Europe/Warsaw, doba dostawy RDN.
+- **Endpoint:** `GET /api/tge` → **36 godzin** + `is_forecast` / `zrodlo`.
+- **Cena:** `fixing1.cena` w PLN/MWh (przecinek).
+- **Skąd:** DB `t_rdn` = Fixing albo prognoza pradcast D+1.
+- **Nie wołaj pradcast bezpośrednio** — tylko `/api/tge`.
+- **Optymalizacja:** `/api/optimize` bierze 24× `market_price` (zwykle z pierwszych 24 slotów).
+- **Timezone:** Europe/Warsaw.
