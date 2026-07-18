@@ -8,6 +8,7 @@
 Użycie (na serwerze, katalog z pradcast_client.py):
   python3 fetch_pradcast_forecast.py
   python3 fetch_pradcast_forecast.py --dry-run
+  python3 fetch_pradcast_forecast.py --force   # nadpisz też wiersze is_forecast=0
 """
 
 from __future__ import annotations
@@ -69,6 +70,10 @@ def _table_columns(cursor) -> set[str]:
 
 
 def _ensure_forecast_flag(cursor, columns: set[str]) -> bool:
+    """
+    Dodaje is_forecast. Istniejące wiersze dostają DEFAULT 0 (traktowane jak realne).
+    To jest zamierzone: jeśli D+1 już ma FIXING z maila, prognoza ich nie nadpisze.
+    """
     if FORECAST_FLAG_COLUMN in columns:
         return False
     cursor.execute(
@@ -116,8 +121,9 @@ def upsert_forecast_records(
     records: list[dict[str, Any]],
     *,
     dry_run: bool = False,
+    force: bool = False,
 ) -> UpsertStats:
-    """INSERT/UPDATE prognoz; nigdy nie nadpisuje is_forecast=0."""
+    """INSERT/UPDATE prognoz; domyślnie nie nadpisuje is_forecast=0 (chyba że force)."""
     if not records:
         return UpsertStats()
 
@@ -129,7 +135,7 @@ def upsert_forecast_records(
         cursor = conn.cursor(dictionary=True)
         columns = _table_columns(cursor)
         if _ensure_forecast_flag(cursor, columns):
-            print(f"Dodano kolumnę {FORECAST_FLAG_COLUMN} do t_rdn")
+            print(f"Dodano kolumnę {FORECAST_FLAG_COLUMN} do t_rdn (DEFAULT 0 = realne)")
 
         required = {"doba", "czas", "cena1", FORECAST_FLAG_COLUMN}
         missing = required - columns
@@ -143,7 +149,7 @@ def upsert_forecast_records(
             flag = existing.get(czas)
             row = _row_values(rec, columns)
 
-            if flag == 0:
+            if flag == 0 and not force:
                 stats.skipped_real += 1
                 continue
 
@@ -155,12 +161,16 @@ def upsert_forecast_records(
                     cursor.execute(sql, [row[c] for c in cols])
                 stats.inserted += 1
             else:
+                # flag == 1, albo force na realnych
                 update_cols = [c for c in row.keys() if c not in ("doba", "czas")]
                 set_sql = ", ".join(f"{c} = %s" for c in update_cols)
-                sql = (
-                    f"UPDATE t_rdn SET {set_sql} "
-                    f"WHERE doba = %s AND czas = %s AND {FORECAST_FLAG_COLUMN} = 1"
-                )
+                if force:
+                    sql = f"UPDATE t_rdn SET {set_sql} WHERE doba = %s AND czas = %s"
+                else:
+                    sql = (
+                        f"UPDATE t_rdn SET {set_sql} "
+                        f"WHERE doba = %s AND czas = %s AND {FORECAST_FLAG_COLUMN} = 1"
+                    )
                 if not dry_run:
                     cursor.execute(sql, [row[c] for c in update_cols] + [doba, czas])
                 stats.updated += 1
@@ -180,6 +190,7 @@ def upsert_forecast_records(
 
 def main() -> int:
     dry_run = "--dry-run" in sys.argv
+    force = "--force" in sys.argv
     d1 = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
     try:
@@ -212,19 +223,32 @@ def main() -> int:
         )
 
     try:
-        stats = upsert_forecast_records(records, dry_run=dry_run)
+        stats = upsert_forecast_records(records, dry_run=dry_run, force=force)
     except Exception as exc:
         print(f"Błąd zapisu do t_rdn: {exc}", file=sys.stderr)
         return 1
 
     mode = "DRY-RUN" if dry_run else "ZAPIS"
+    if force:
+        mode += "+FORCE"
     print(
         f"\n[{mode}] t_rdn doba={forecast.get('date')} "
         f"inserted={stats.inserted} updated={stats.updated} "
         f"skipped_real={stats.skipped_real} total={stats.total}"
     )
+    if stats.skipped_real and stats.inserted == 0 and stats.updated == 0:
+        print(
+            "\nWszystkie sloty już mają is_forecast=0 (cena realna) — celowo pominięte.\n"
+            "Sprawdź w MySQL:\n"
+            f"  SELECT czas, cena1, is_forecast FROM t_rdn WHERE doba='{forecast.get('date')}' "
+            "ORDER BY czas LIMIT 8;\n"
+            "Jeśli to NIE są realne ceny i chcesz nadpisać prognozą:\n"
+            "  python3 fetch_pradcast_forecast.py --force"
+        )
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    code = main()
+    if code:
+        sys.exit(code)
