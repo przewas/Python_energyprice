@@ -347,11 +347,12 @@ from tge_get_from_db import get_tge_prices_data, get_tge_prices_rolling
 @app.route("/api/tge")
 def get_tge_prices():
     """
-    Domyślnie: rolling 36h godzinowych cen z t_rdn + is_forecast/zrodlo.
+    Domyślnie: rolling 36h kwadransów z t_rdn (144 sloty) + is_forecast/zrodlo.
 
     Query:
-      hours=36          — długość horyzontu (1..72), domyślnie 36
-      mode=day&date=... — stary tryb: jedna doba (wszystkie sloty 15-min)
+      hours=36          — długość horyzontu w godzinach (1..72), domyślnie 36
+                          → count = hours * 4 (interwał 15 min)
+      mode=day&date=... — jedna doba (96 kwadransów)
     """
     try:
         mode = (request.args.get("mode") or "rolling").strip().lower()

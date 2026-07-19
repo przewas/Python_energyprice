@@ -1,7 +1,8 @@
-"""Jeden skrypt: prognoza D+1 z pradcast.pl → zapis do t_rdn.
+"""Jeden skrypt: prognoza D+1 i D+2 z pradcast.pl → zapis do t_rdn.
 
-- pobiera prognozę (24h PLN/MWh)
-- rozbija na 96 kwadransów z datą/czasem
+- pobiera prognozę (24h PLN/MWh) dla D+1 oraz D+2
+- każdą godzinę zapisuje jako 4 kwadranse (np. 20 PLN @ 08:00 →
+  08:00, 08:15, 08:30, 08:45) = 96 rekordów / dobę
 - UPSERT do t_rdn z is_forecast=1
 - nie nadpisuje cen realnych (is_forecast=0)
 
@@ -188,36 +189,40 @@ def upsert_forecast_records(
         conn.close()
 
 
-def main() -> int:
-    dry_run = "--dry-run" in sys.argv
-    force = "--force" in sys.argv
-    d1 = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
+def _import_horizon(label: str, target_date: str, *, dry_run: bool, force: bool) -> int:
     try:
-        forecast = fetch_forecast_for_date(d1)
+        forecast = fetch_forecast_for_date(target_date)
     except PradcastAPIError as exc:
-        print(f"Błąd pradcast.pl: {exc}", file=sys.stderr)
+        print(f"Błąd pradcast.pl ({label} {target_date}): {exc}", file=sys.stderr)
         return 1
 
     prices = forecast.get("prices") or []
     if not prices:
-        print("Brak cen w odpowiedzi.", file=sys.stderr)
+        print(f"Brak cen w odpowiedzi ({label}).", file=sys.stderr)
         return 1
 
     records = hourly_prices_to_rdn_records(forecast)
     values = [float(p["price"]) for p in prices]
 
-    print(f"as_of: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("horizon: D+1")
-    print(f"date: {forecast.get('date')}  source={forecast.get('source')}")
+    print(f"\n=== {label}  date={forecast.get('date')}  source={forecast.get('source')} ===")
     print(f"godzin: {len(prices)}  min={min(values):.2f}  max={max(values):.2f}  PLN/MWh")
-    print(f"rekordów 15-min: {len(records)}")
+    print(f"rekordów 15-min: {len(records)}  (każda godzina → 4 kwadranse)")
+
+    # pokaż przykładowe rozbicie jednej godziny
+    samples = [r for r in records if r["czas"].startswith("08:")][:4]
+    if samples:
+        print("przykład rozbicia godz. 08:")
+        for rec in samples:
+            print(
+                f"  {rec['czas_ceny']}  {rec['cena1']} gr/MWh  "
+                f"({rec['cena1'] / 100:.2f} PLN/MWh)"
+            )
 
     for entry in sorted(prices, key=lambda item: int(item["hour"])):
         hour = int(entry["hour"])
-        sample = next(r for r in records if r["czas"].startswith(f"{hour:02d}:"))
+        sample = next(r for r in records if r["czas"].startswith(f"{hour:02d}:00"))
         print(
-            f"  {sample['czas_ceny']}  "
+            f"  {sample['czas_ceny']} (+ :15/:30/:45)  "
             f"{float(entry['price']):8.2f} PLN/MWh  "
             f"({int(sample['cena1'])} gr)  {entry.get('level', '')}"
         )
@@ -225,27 +230,39 @@ def main() -> int:
     try:
         stats = upsert_forecast_records(records, dry_run=dry_run, force=force)
     except Exception as exc:
-        print(f"Błąd zapisu do t_rdn: {exc}", file=sys.stderr)
+        print(f"Błąd zapisu do t_rdn ({label}): {exc}", file=sys.stderr)
         return 1
 
     mode = "DRY-RUN" if dry_run else "ZAPIS"
     if force:
         mode += "+FORCE"
     print(
-        f"\n[{mode}] t_rdn doba={forecast.get('date')} "
+        f"[{mode}] t_rdn doba={forecast.get('date')} "
         f"inserted={stats.inserted} updated={stats.updated} "
         f"skipped_real={stats.skipped_real} total={stats.total}"
     )
     if stats.skipped_real and stats.inserted == 0 and stats.updated == 0:
         print(
-            "\nWszystkie sloty już mają is_forecast=0 (cena realna) — celowo pominięte.\n"
-            "Sprawdź w MySQL:\n"
-            f"  SELECT czas, cena1, is_forecast FROM t_rdn WHERE doba='{forecast.get('date')}' "
-            "ORDER BY czas LIMIT 8;\n"
-            "Jeśli to NIE są realne ceny i chcesz nadpisać prognozą:\n"
-            "  python3 fetch_pradcast_forecast.py --force"
+            f"  → wszystkie sloty {forecast.get('date')} mają is_forecast=0 — pominięte.\n"
+            "    Nadpisanie: python3 fetch_pradcast_forecast.py --force"
         )
     return 0
+
+
+def main() -> int:
+    dry_run = "--dry-run" in sys.argv
+    force = "--force" in sys.argv
+    now = datetime.now()
+    d1 = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    d2 = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+
+    print(f"as_of: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("horyzonty: D+1, D+2  (zapis kwadransowy do t_rdn)")
+
+    rc = 0
+    rc |= _import_horizon("D+1", d1, dry_run=dry_run, force=force)
+    rc |= _import_horizon("D+2", d2, dry_run=dry_run, force=force)
+    return rc
 
 
 if __name__ == "__main__":

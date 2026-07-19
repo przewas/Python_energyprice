@@ -18,6 +18,7 @@ DB_CONFIG = {
 FORECAST_TZ = ZoneInfo("Europe/Warsaw")
 FORECAST_FLAG_COLUMN = "is_forecast"
 DEFAULT_HORIZON_HOURS = 36
+INTERVAL_MINUTES = 15
 
 
 def _connect():
@@ -54,6 +55,11 @@ def _format_price_grosze(value: Any) -> str | None:
         return None
 
 
+def _floor_to_interval(dt: datetime, minutes: int = INTERVAL_MINUTES) -> datetime:
+    minute = (dt.minute // minutes) * minutes
+    return dt.replace(minute=minute, second=0, microsecond=0)
+
+
 def _slot_payload(
     *,
     doba: str,
@@ -76,6 +82,7 @@ def _slot_payload(
         "czas": czas,
         "czas_ceny": f"{doba} {czas}",
         "godzina": czas[:5],
+        "interwal_minut": INTERVAL_MINUTES,
         "fixing1": {
             "cena": _format_price_grosze(cena1),
             "vol": None if wolumen1 is None else str(wolumen1),
@@ -95,19 +102,19 @@ def get_tge_prices_rolling(
     start_at: datetime | None = None,
 ) -> dict[str, Any]:
     """
-    Rolling horyzont godzinowy z t_rdn (domyślnie 36h od bieżącej godziny PL).
+    Rolling horyzont kwadransowy z t_rdn (domyślnie 36h = 144 sloty 15-min).
 
-    Bierze sloty :00 każdej godziny. Dla każdego slotu zwraca is_forecast / zrodlo.
+    Start: bieżący kwadrans (Europe/Warsaw).
     Brak danych w DB → is_forecast=null, zrodlo='brak', cena=null.
     """
     horizon_hours = max(1, min(int(horizon_hours), 72))
     now = start_at.astimezone(FORECAST_TZ) if start_at else datetime.now(FORECAST_TZ)
-    start = now.replace(minute=0, second=0, microsecond=0)
+    start = _floor_to_interval(now)
     end = start + timedelta(hours=horizon_hours)
+    slot_count = horizon_hours * (60 // INTERVAL_MINUTES)
 
-    # doba od startu do ostatniego slotu włącznie (end jest exclusive)
-    last_slot = end - timedelta(hours=1)
-    days = []
+    last_slot = end - timedelta(minutes=INTERVAL_MINUTES)
+    days: list[str] = []
     day = start.date()
     while day <= last_slot.date():
         days.append(day.strftime("%Y-%m-%d"))
@@ -126,8 +133,7 @@ def get_tge_prices_rolling(
                    {flag_select}
             FROM t_rdn
             WHERE doba IN ({placeholders})
-              AND MINUTE(czas) = 0
-              AND SECOND(czas) = 0
+              AND MINUTE(czas) IN (0, 15, 30, 45)
             ORDER BY doba, czas
             """,
             days,
@@ -156,8 +162,8 @@ def get_tge_prices_rolling(
         }
 
     godziny: list[dict[str, Any]] = []
-    for i in range(horizon_hours):
-        slot_dt = start + timedelta(hours=i)
+    for i in range(slot_count):
+        slot_dt = start + timedelta(minutes=INTERVAL_MINUTES * i)
         doba = slot_dt.strftime("%Y-%m-%d")
         czas = slot_dt.strftime("%H:%M:%S")
         found = by_key.get((doba, czas))
@@ -192,6 +198,7 @@ def get_tge_prices_rolling(
 
     return {
         "horizon_hours": horizon_hours,
+        "interval_minutes": INTERVAL_MINUTES,
         "timezone": "Europe/Warsaw",
         "start": start.strftime("%Y-%m-%d %H:%M:%S"),
         "end": end.strftime("%Y-%m-%d %H:%M:%S"),
@@ -204,7 +211,7 @@ def get_tge_prices_rolling(
 
 
 def get_tge_prices_data(date=None):
-    """Jedna doba (sloty 15-min) — tryb legacy mode=day. Nowy kontrakt: rolling."""
+    """Jedna doba (sloty 15-min) — tryb legacy mode=day."""
     conn = _connect()
     cursor = conn.cursor(dictionary=True)
 
@@ -237,6 +244,7 @@ def get_tge_prices_data(date=None):
                {flag_select}
         FROM t_rdn
         WHERE doba = %s
+          AND MINUTE(czas) IN (0, 15, 30, 45)
         ORDER BY czas
         """,
         (selected_doba,),
@@ -265,6 +273,7 @@ def get_tge_prices_data(date=None):
 
     return {
         "ceny_dla_dnia": str(selected_doba),
+        "interval_minutes": INTERVAL_MINUTES,
         "godziny": godziny,
     }
 
@@ -274,23 +283,8 @@ if __name__ == "__main__":
 
     try:
         data = get_tge_prices_rolling(36)
-        print(json.dumps(data, indent=2, ensure_ascii=False))
+        print(json.dumps({k: data[k] for k in data if k != "godziny"}, indent=2, ensure_ascii=False))
+        print("first3:", json.dumps(data["godziny"][:3], indent=2, ensure_ascii=False))
     except Exception as exc:
-        print(f"DB niedostępna lokalnie ({exc}) — smoke test formatu:")
-        demo = {
-            "horizon_hours": 36,
-            "timezone": "Europe/Warsaw",
-            "count": 36,
-            "godziny": [
-                _slot_payload(
-                    doba="2026-07-19",
-                    czas="00:00:00",
-                    cena1=57646,
-                    wolumen1=0,
-                    cena2=0,
-                    wolumen2=0,
-                    is_forecast=True,
-                )
-            ],
-        }
-        print(json.dumps(demo, indent=2, ensure_ascii=False))
+        print(f"DB niedostępna lokalnie ({exc})")
+        print("expected count for 36h:", 36 * 4)

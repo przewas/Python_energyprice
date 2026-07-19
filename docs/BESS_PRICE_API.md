@@ -55,7 +55,7 @@ mail FIXING / tge.html (realne) ──────┘  (is_forecast=0, nadpisuje
 
 ## 3. API cen — `GET /api/tge`
 
-### Request (domyślny — rolling 36h)
+### Request (domyślny — rolling 36h kwadransów)
 ```
 GET /api/tge
 GET /api/tge?hours=36
@@ -63,44 +63,51 @@ GET /api/tge?hours=36
 
 | Parametr | Wymagany | Opis |
 |----------|----------|------|
-| `hours` | nie | Liczba godzin horyzontu (1..72). Domyślnie **36**. |
-| `mode=day&date=YYYY-MM-DD` | nie | Stary tryb: jedna doba, wszystkie sloty 15-min. |
+| `hours` | nie | Horyzont w **godzinach** (1..72). Domyślnie **36** → **144** kwadranse. |
+| `mode=day&date=YYYY-MM-DD` | nie | Jedna doba (96 kwadransów). |
 
 Źródło odpowiedzi: wyłącznie tabela **`t_rdn`** (nie wywołuje pradcast na żywo).
-Start horyzontu: **bieżąca godzina** w `Europe/Warsaw` (zaokrąglenie w dół do pełnej godziny).
-Rozdzielczość: **1 godzina** (slot `:00` z bazy; baza trzyma też kwadranse).
+Start: **bieżący kwadrans** `Europe/Warsaw` (np. 09:07 → 09:00).
+Rozdzielczość: **15 minut** (`00` / `15` / `30` / `45`).
 
-### Response (rolling 36)
+Prognoza pradcast (godzinowa) jest przed zapisem **rozbijana na 4 kwadranse**
+(np. 20 PLN @ 08:00 → rekordy 08:00, 08:15, 08:30, 08:45 z tą samą ceną).
+Ceny realne RDN z maila FIXING są już natywnie 15-min.
+
+### Response (rolling 36h = 144 kwadranse)
 ```json
 {
   "horizon_hours": 36,
+  "interval_minutes": 15,
   "timezone": "Europe/Warsaw",
-  "start": "2026-07-18 15:00:00",
-  "end": "2026-07-20 03:00:00",
-  "count": 36,
-  "available": 34,
-  "real_count": 10,
-  "forecast_count": 24,
+  "start": "2026-07-19 09:00:00",
+  "end": "2026-07-20 21:00:00",
+  "count": 144,
+  "available": 140,
+  "real_count": 60,
+  "forecast_count": 80,
   "godziny": [
     {
-      "doba": "2026-07-18",
-      "czas": "15:00:00",
-      "czas_ceny": "2026-07-18 15:00:00",
-      "godzina": "15:00",
-      "fixing1": { "cena": "420,00", "vol": "100" },
+      "doba": "2026-07-19",
+      "czas": "09:00:00",
+      "czas_ceny": "2026-07-19 09:00:00",
+      "godzina": "09:00",
+      "interwal_minut": 15,
+      "fixing1": { "cena": "151,55", "vol": "1200" },
       "fixing2": { "cena": "0,00", "vol": "0" },
       "is_forecast": false,
       "zrodlo": "realna"
     },
     {
       "doba": "2026-07-19",
-      "czas": "10:00:00",
-      "czas_ceny": "2026-07-19 10:00:00",
-      "godzina": "10:00",
-      "fixing1": { "cena": "80,56", "vol": "0" },
+      "czas": "09:15:00",
+      "czas_ceny": "2026-07-19 09:15:00",
+      "godzina": "09:15",
+      "interwal_minut": 15,
+      "fixing1": { "cena": "148,20", "vol": "1100" },
       "fixing2": { "cena": "0,00", "vol": "0" },
-      "is_forecast": true,
-      "zrodlo": "prognoza"
+      "is_forecast": false,
+      "zrodlo": "realna"
     }
   ]
 }
@@ -110,11 +117,12 @@ Rozdzielczość: **1 godzina** (slot `:00` z bazy; baza trzyma też kwadranse).
 
 | Pole | Znaczenie |
 |------|-----------|
-| `godziny` | Zawsze **36** elementów (lub `hours`) — po jednej cenie na godzinę |
-| `godziny[].czas_ceny` | Data+czas slotu (PL) |
-| `godziny[].fixing1.cena` | **Cena do harmonogramu** — PLN/MWh, string z przecinkiem; `null` jeśli brak w DB |
-| `godziny[].is_forecast` | `false` = cena realna (FIXING), `true` = prognoza, `null` = brak danych |
-| `godziny[].zrodlo` | `"realna"` \| `"prognoza"` \| `"brak"` — wygodna etykieta dla agenta |
+| `count` | **144** przy `hours=36` (36 × 4) |
+| `interval_minutes` | zawsze `15` |
+| `godziny[].czas_ceny` | Data+czas slotu kwadransa (PL) |
+| `godziny[].fixing1.cena` | **Cena do harmonogramu** — PLN/MWh; `null` jeśli brak w DB |
+| `godziny[].is_forecast` | `false` = FIXING, `true` = prognoza, `null` = brak |
+| `godziny[].zrodlo` | `"realna"` \| `"prognoza"` \| `"brak"` |
 
 ### Konwersja ceny do float (Python)
 ```python
@@ -126,10 +134,17 @@ else:
     price_pln_kwh = price_pln_mwh / 1000.0
 ```
 
-### Wektor pod optymalizator (pierwsze 24h z rolling 36)
+### Wektor godzinowy pod `/api/optimize` (z kwadransów)
+`/api/optimize` nadal bierze **24 godziny**. Z rolling 15-min weź slot `:00`
+każdej z pierwszych 24 godzin (albo średnią z 4 kwadransów godziny).
+
 ```python
 market_price_kwh = []
-for row in data["godziny"][:24]:
+for row in data["godziny"]:
+    if not row["godzina"].endswith(":00"):
+        continue
+    if len(market_price_kwh) >= 24:
+        break
     raw = row["fixing1"]["cena"]
     if raw is None:
         raise ValueError(f"Brak ceny dla {row['czas_ceny']}")
