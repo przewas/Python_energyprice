@@ -254,3 +254,28 @@ def default_rdn_import_date() -> str:
 
 def default_forecast_date() -> str:
     return default_rdn_import_date()
+
+
+def delivery_date_d1(*, as_of: datetime | None = None) -> str:
+    """Data dostawy D+1 względem as_of (domyślnie teraz, lokalnie)."""
+    base = as_of or datetime.now()
+    return (base + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def fetch_forecast_d1(*, as_of: datetime | None = None) -> dict[str, Any]:
+    """
+    Pobiera prognozę modelu pradcast.pl dla D+1.
+
+    Zwraca:
+      {
+        "as_of": "...",
+        "horizon": "D+1",
+        "forecast": { date, source, currency, unit, prices[24] }
+      }
+    """
+    d1 = delivery_date_d1(as_of=as_of)
+    return {
+        "as_of": (as_of or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
+        "horizon": "D+1",
+        "forecast": fetch_forecast_for_date(d1),
+    }

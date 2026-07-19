@@ -2,7 +2,8 @@
 """
 Import cen RDN (96 × 15 min) z maila FIXING na Gmailu → t_rdn.
 
-Prognozy: osobno tge_predict.py (API pradcast.pl).
+Zapisuje ceny realne (is_forecast=0) — UPSERT nadpisuje wcześniejszą prognozę.
+Prognozy: osobno fetch_pradcast_forecast.py (API pradcast.pl).
 """
 
 from __future__ import annotations
@@ -28,11 +29,31 @@ DB_CONFIG = {
     "database": "przewas$scadaPv",
 }
 
+FORECAST_FLAG_COLUMN = "is_forecast"
+
 
 def connect_db():
     import mysql.connector
 
     return mysql.connector.connect(**DB_CONFIG)
+
+
+def ensure_forecast_flag_column(conn) -> None:
+    cursor = conn.cursor()
+    cursor.execute(f"SHOW COLUMNS FROM t_rdn LIKE '{FORECAST_FLAG_COLUMN}'")
+    if cursor.fetchone():
+        cursor.close()
+        return
+    cursor.execute(
+        f"""
+        ALTER TABLE t_rdn
+        ADD COLUMN {FORECAST_FLAG_COLUMN} TINYINT(1) NOT NULL DEFAULT 0
+        COMMENT '1=prognoza, 0=cena realna'
+        """
+    )
+    conn.commit()
+    cursor.close()
+    log(f"Dodano kolumnę {FORECAST_FLAG_COLUMN} do t_rdn")
 
 
 def validate_parsed_data(records, date_str):
@@ -97,13 +118,15 @@ def validate_parsed_data(records, date_str):
     return True
 
 
-def check_if_data_exists(conn, date_str):
+def check_if_real_data_exists(conn, date_str) -> bool:
+    """True gdy doba ma już pełne 96 slotów z ceną realną (is_forecast=0)."""
     cursor = conn.cursor()
     cursor.execute(
-        """
+        f"""
         SELECT COUNT(*)
         FROM t_rdn
         WHERE doba=%s
+          AND {FORECAST_FLAG_COLUMN}=0
           AND MINUTE(czas) IN (0, 15, 30, 45)
         """,
         (date_str,),
@@ -114,34 +137,61 @@ def check_if_data_exists(conn, date_str):
 
 
 def insert_data(conn, records):
+    """UPSERT cen realnych — zawsze ustawia is_forecast=0 (nadpisuje prognozę)."""
     cursor = conn.cursor()
-    sql = """
-        INSERT INTO t_rdn (czas_ceny, doba, czas, cena1, cena2)
-        VALUES (%s, %s, %s, %s, %s)
+
+    # sprawdź opcjonalne kolumny
+    cursor.execute("SHOW COLUMNS FROM t_rdn")
+    columns = {row[0] for row in cursor.fetchall()}
+
+    preferred = [
+        "czas_ceny",
+        "doba",
+        "czas",
+        "czas_do",
+        "interwal_minut",
+        "cena1",
+        "cena2",
+        FORECAST_FLAG_COLUMN,
+    ]
+    cols = [c for c in preferred if c in columns]
+    if "doba" not in cols or "czas" not in cols or "cena1" not in cols:
+        raise RuntimeError("t_rdn: brak wymaganych kolumn doba/czas/cena1")
+    if FORECAST_FLAG_COLUMN not in cols:
+        raise RuntimeError(f"t_rdn: brak kolumny {FORECAST_FLAG_COLUMN}")
+
+    col_sql = ", ".join(cols)
+    placeholders = ", ".join(["%s"] * len(cols))
+    update_cols = [c for c in cols if c not in ("doba", "czas")]
+    update_sql = ", ".join(f"{c}=VALUES({c})" for c in update_cols)
+
+    sql = f"""
+        INSERT INTO t_rdn ({col_sql})
+        VALUES ({placeholders})
         ON DUPLICATE KEY UPDATE
-            czas_ceny = VALUES(czas_ceny),
-            cena1 = VALUES(cena1),
-            cena2 = VALUES(cena2)
+            {update_sql}
     """
+
     for record in records:
-        cursor.execute(
-            sql,
-            (
-                record["czas_ceny"],
-                record["doba"],
-                record["czas"],
-                record["cena1"],
-                record["cena2"],
-            ),
-        )
+        row = {
+            "czas_ceny": record["czas_ceny"],
+            "doba": record["doba"],
+            "czas": record["czas"],
+            "czas_do": record.get("czas_do"),
+            "interwal_minut": int(record.get("interwal_minut", 15)),
+            "cena1": int(record["cena1"]),
+            "cena2": int(record.get("cena2", 0)),
+            FORECAST_FLAG_COLUMN: 0,
+        }
+        cursor.execute(sql, [row[c] for c in cols])
 
     conn.commit()
     cursor.close()
-    print(f"Zapisano {len(records)} rekordow do t_rdn")
+    print(f"Zapisano {len(records)} rekordow do t_rdn (is_forecast=0, grosze/MWh)")
 
 
 def main():
-    log("Start import_rdn_mail.py (Gmail → t_rdn)")
+    log("Start import_rdn_mail.py (Gmail → t_rdn, ceny realne)")
     mail = None
     try:
         mail = connect_imap()
@@ -164,16 +214,25 @@ def main():
 
         log("Podgląd danych:")
         for row in parsed_data[:8]:
-            log(f"{row['czas']} - {row['czas_do']} | {row['cena1']} groszy")
+            log(
+                f"{row['czas_ceny']} | {row['czas']} - {row['czas_do']} | "
+                f"{row['cena1']} groszy ({row['cena1'] / 100:.2f} PLN/MWh)"
+            )
         if len(parsed_data) > 8:
             log(f"... razem {len(parsed_data)} rekordów")
 
         conn = connect_db()
         try:
-            if check_if_data_exists(conn, fixing_date):
-                log(f"Dane 15-minutowe dla {fixing_date} już istnieją — pomijam zapis.")
+            ensure_forecast_flag_column(conn)
+
+            if check_if_real_data_exists(conn, fixing_date):
+                log(
+                    f"Realne ceny 15-min dla {fixing_date} już istnieją "
+                    f"(is_forecast=0) — pomijam zapis."
+                )
             elif validate_parsed_data(parsed_data, fixing_date):
                 insert_data(conn, parsed_data)
+                log(f"Nadpisano/uzupełniono t_rdn dla {fixing_date} jako ceny realne.")
             else:
                 log("Walidacja nie powiodła się — zapis przerwany.")
                 sys.exit(1)
@@ -184,6 +243,7 @@ def main():
     except Exception as exc:
         log(f"BŁĄD: {exc}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:
